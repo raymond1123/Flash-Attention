@@ -33,8 +33,8 @@ def manual_attn_fp32(Q, K, V):
 
 if __name__ == '__main__':
     # Load the CUDA kernel as a python module
-    minimal_attn = load(name='minimal_attn', sources=['main.cpp', './fa_2/flash_base.cu'], extra_cuda_cflags=['-O2'])
     #minimal_attn = load(name='minimal_attn', sources=['main.cpp', './fa_1/flash_base.cu'], extra_cuda_cflags=['-O2'])
+    minimal_attn = load(name='minimal_attn', sources=['main.cpp', './fa_2/flash_base.cu'], extra_cuda_cflags=['-O2'])
 
     # Use small model params, otherwise slower than manual attention. See caveats in README.
     batch_size = 2
