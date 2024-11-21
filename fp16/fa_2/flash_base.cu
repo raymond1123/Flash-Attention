@@ -3,6 +3,100 @@
 #include <cuda_runtime.h>
 #include <torch/types.h>
 
+__global__
+void forward_kernel(const __half* Q, const __half* K, const __half* V, 
+                    const int N, const int d,
+                    const int Tc, const int Tr, const int Bc, const int Br, 
+                    const float softmax_scale_in,
+                    __half* l, __half *m, __half* O) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
+
+    // Offset into Q,K,V,O,l,m - different for each batch and head
+    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
+    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
+
+    // Define SRAM for Q,K,V,S
+    extern __shared__ __half sram[];
+    int tile_size = Bc * d;  // size of Qi, Kj, Vj
+    __half* Qi = sram;
+    __half* Kj = &sram[tile_size];
+    __half* Vj = &sram[tile_size * 2];
+    //__half* Oi = &sram[tile_size * 3];
+    __half* S = &sram[tile_size * 3];
+
+    const __half softmax_scale = __float2half(softmax_scale_in);
+    for (int i = 0; i < Tr; i++) {
+        // Load Qi to SRAM, l and m to registers
+        for (int x = 0; x < d; x++) {
+            Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
+        }
+
+        __half row_m_new;
+        __half row_l_new;
+        __half row_m_prev = m[lm_offset + (Br * i) + tx];
+        __half row_l_prev = l[lm_offset + (Br * i) + tx];
+        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+
+        for (int j = 0; j < Tc; j++)  {
+
+            // Load Kj, Vj to SRAM
+            for (int x = 0; x < d; x++) {
+                Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
+                Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
+            }
+
+            // 1. S = QK^T, row_m = rowmax(S)
+            __half row_m = __float2half(-INFINITY);
+            for (int y = 0; y < Bc; y++) {
+                __half sum = __float2half(0.0f);
+                for (int x = 0; x < d; x++) {
+                    sum = __hadd(sum, __hmul(Qi[(tx * d) + x], Kj[(y * d) + x]));
+                }
+                sum = __hmul(sum, softmax_scale);
+                S[(Bc * tx) + y] = sum;
+
+                if (__hgt(sum, row_m))
+                    row_m = sum;
+            }
+
+            // 2. P = exp(S - row_m), row_l = rowsum(P)
+            row_m_new = __hgt(row_m_prev, row_m)?row_m_prev:row_m;
+            __half row_l = __float2half(0.0f);
+            for (int y = 0; y < Bc; y++) {
+                S[(Bc * tx) + y] = hexp(__hsub(S[(Bc * tx) + y], row_m_new));
+                row_l = __hadd(row_l, S[(Bc * tx) + y]);
+            }
+
+            // Compute new m and l
+            row_l_new =  __hadd(row_l, __hmul(hexp(__hsub(row_m_prev, row_m_new)), row_l_prev));
+
+            // Write O, l, m to HBM
+            for (int x = 0; x < d; x++) {
+                __half pv = __float2half(0.0f);  // Pij * Vj ==> (Br, Bc)@(Bc, d) = (Br, d)
+                for (int y = 0; y < Bc; y++) {
+                    pv = __hadd(pv, __hmul(S[(Bc * tx) + y], Vj[(y * d) + x]));
+                }
+
+                __half tmp = __hmul(hexp(__hsub(row_m_prev, row_m_new)), O[qkv_offset + (tile_size * i) + (tx * d) + x]);
+                O[qkv_offset + (tile_size * i) + (tx * d) + x] = __hadd(pv, tmp); 
+            }
+
+            row_m_prev = row_m_new;
+            row_l_prev = row_l_new;
+
+        } // for Tc, j  
+        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
+
+        for (int x = 0; x < d; x++) {
+            O[qkv_offset + (tile_size * i) + (tx * d) + x] = 
+                __hmul(O[qkv_offset + (tile_size * i) + (tx * d) + x], __hdiv(__float2half(1.0f), row_l_new)); 
+        }
+
+        l[lm_offset + (Br * i) + tx] = __hadd(row_m_new, hlog(row_l_new)); 
+    } // for Tr, i
+}
+
 /* 
     dO.shape=(Br, d) 
     O.shape=(Br, d) 
@@ -180,100 +274,6 @@ void backward_kernel(const __half* Q, const __half* K, const __half* V,
     }
 }
 
-__global__
-void forward_kernel(const __half* Q, const __half* K, const __half* V, 
-                    const int N, const int d,
-                    const int Tc, const int Tr, const int Bc, const int Br, 
-                    __half* l, __half *m, __half* O) {
-    int tx = threadIdx.x;
-    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
-
-    const __half softmax_scale = __hdiv(__float2half(1.0), hsqrt(__float2half(static_cast<float>(d))));
-
-    // Offset into Q,K,V,O,l,m - different for each batch and head
-    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
-    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
-
-    // Define SRAM for Q,K,V,S
-    extern __shared__ __half sram[];
-    int tile_size = Bc * d;  // size of Qi, Kj, Vj
-    __half* Qi = sram;
-    __half* Kj = &sram[tile_size];
-    __half* Vj = &sram[tile_size * 2];
-    //__half* Oi = &sram[tile_size * 3];
-    __half* S = &sram[tile_size * 3];
-
-    for (int i = 0; i < Tr; i++) {
-        // Load Qi to SRAM, l and m to registers
-        for (int x = 0; x < d; x++) {
-            Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
-            //Oi[(tx * d) + x] = O[qkv_offset + (tile_size * i) + (tx * d) + x];
-        }
-
-        __half row_m_new;
-        __half row_l_new;
-        __half row_m_prev = m[lm_offset + (Br * i) + tx];
-        __half row_l_prev = l[lm_offset + (Br * i) + tx];
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
-
-        for (int j = 0; j < Tc; j++)  {
-
-            // Load Kj, Vj to SRAM
-            for (int x = 0; x < d; x++) {
-                Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
-                Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
-            }
-
-            // 1. S = QK^T, row_m = rowmax(S)
-            __half row_m = __float2half(-INFINITY);
-            for (int y = 0; y < Bc; y++) {
-                __half sum = __float2half(0.0f);
-                for (int x = 0; x < d; x++) {
-                    sum = __hadd(sum, __hmul(Qi[(tx * d) + x], Kj[(y * d) + x]));
-                }
-                sum = __hmul(sum, softmax_scale);
-                S[(Bc * tx) + y] = sum;
-
-                if (__hgt(sum, row_m))
-                    row_m = sum;
-            }
-
-            // 2. P = exp(S - row_m), row_l = rowsum(P)
-            row_m_new = __hgt(row_m_prev, row_m)?row_m_prev:row_m;
-            __half row_l = __float2half(0.0f);
-            for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = hexp(__hsub(S[(Bc * tx) + y], row_m_new));
-                row_l = __hadd(row_l, S[(Bc * tx) + y]);
-            }
-
-            // Compute new m and l
-            row_l_new =  __hadd(row_l, __hmul(hexp(__hsub(row_m_prev, row_m_new)), row_l_prev));
-
-            // Write O, l, m to HBM
-            for (int x = 0; x < d; x++) {
-                __half pv = __float2half(0.0f);  // Pij * Vj ==> (Br, Bc)@(Bc, d) = (Br, d)
-                for (int y = 0; y < Bc; y++) {
-                    pv = __hadd(pv, __hmul(S[(Bc * tx) + y], Vj[(y * d) + x]));
-                }
-
-                __half tmp = __hmul(hexp(__hsub(row_m_prev, row_m_new)), O[qkv_offset + (tile_size * i) + (tx * d) + x]);
-                O[qkv_offset + (tile_size * i) + (tx * d) + x] = __hadd(pv, tmp); 
-            }
-
-            row_m_prev = row_m_new;
-            row_l_prev = row_l_new;
-
-        } // for Tc, j  
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
-
-        for (int x = 0; x < d; x++) {
-            O[qkv_offset + (tile_size * i) + (tx * d) + x] = 
-                __hmul(O[qkv_offset + (tile_size * i) + (tx * d) + x], __hdiv(__float2half(1.0f), row_l_new)); 
-        }
-
-        l[lm_offset + (Br * i) + tx] = __hadd(row_m_new, hlog(row_l_new)); 
-    } // for Tr, i
-}
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> forward(torch::Tensor Q, 
                                                                 torch::Tensor K, 
@@ -281,14 +281,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> forward(torch::Tensor Q,
                                                                 torch::Tensor l, 
                                                                 torch::Tensor m) {
     // TODO: determine Bc, Br dynamically
-    const int M = 64*1024; // shared memory size
+    const int M = 64*1024; // shared memory size 64K
     //const int Bc = 32; const int Br = 32;
 
+    // Q.shape = K.shape = V.shape = [B,nh,N,d]
     const int B = Q.size(0); const int nh = Q.size(1);
     const int N = Q.size(2); const int d = Q.size(3);
-    const int Bc = M/(4*d*sizeof(__half)); const int Br = M/(4*d*sizeof(__half));
+    const int Bc = M/(4*d*sizeof(__half)); 
+    const int Br = Bc<d?Bc:d;
+    printf("Bc=%d, Br=%d\n", Bc, Br);
+    const int allocate_m = 64*1024+4*Br*sizeof(half); // shared memory size
 
     const int Tc = ceil((float) N / Bc); const int Tr = ceil((float) N / Br);
+    const float softmax_scale = 1.0/sqrt(d); 
 
     // Initialize O, l, m to HBM
     auto O = torch::zeros_like(Q, torch::dtype(torch::kHalf));
@@ -296,7 +301,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> forward(torch::Tensor Q,
     O = O.to(device);
 
     // Calculate SRAM size needed per block
-    cudaFuncSetAttribute(forward_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, M);
+    cudaFuncSetAttribute(forward_kernel, 
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, allocate_m);
+    printf("allocate %d shared memory\n", allocate_m);
 
     dim3 grid_dim(B, nh);  // batch_size x num_heads
     dim3 block_dim(Bc);  // Bc threads per block
@@ -305,7 +312,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> forward(torch::Tensor Q,
         reinterpret_cast<__half*>(Q.data_ptr<c10::Half>()), 
         reinterpret_cast<__half*>(K.data_ptr<c10::Half>()), 
         reinterpret_cast<__half*>(V.data_ptr<c10::Half>()),
-        N, d, Tc, Tr, Bc, Br, 
+        N, d, Tc, Tr, Bc, Br, softmax_scale,
         reinterpret_cast<__half*>(l.data_ptr<c10::Half>()), 
         reinterpret_cast<__half*>(m.data_ptr<c10::Half>()), 
         reinterpret_cast<__half*>(O.data_ptr<c10::Half>())

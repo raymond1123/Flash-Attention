@@ -32,14 +32,13 @@ def manual_attn_fp16(Q, K, V):
 
 if __name__ == '__main__':
     # Load the CUDA kernel as a python module
-    minimal_attn = load(name='minimal_attn', sources=['main.cpp', './fa_1/flash_base.cu'], extra_cuda_cflags=['-O2'])
-    #minimal_attn = load(name='minimal_attn', sources=['main.cpp', './fa_2/flash_base.cu'], extra_cuda_cflags=['-O2'])
+    #minimal_attn = load(name='minimal_attn', sources=['main.cpp', './fa_1/flash_base.cu'], extra_cuda_cflags=['-O2'])
+    minimal_attn = load(name='minimal_attn', sources=['main.cpp', './fa_2/flash_base.cu'], extra_cuda_cflags=['-O2'])
 
     # Use small model params, otherwise slower than manual attention. See caveats in README.
     batch_size = 2
     n_head = 32
     seq_len = 128
-    #head_embd = 64
     head_embd = 128
 
     q = torch.randn(batch_size, n_head, seq_len, head_embd, dtype=torch.float16).cuda().requires_grad_(True)
